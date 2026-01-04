@@ -1,10 +1,15 @@
 """
 ============================================================================
-AUSGRID GENERATION DATA - ETL PIPELINE (FIXED)
+AUSGRID GENERATION DATA - ETL PIPELINE (FIXED VERSION)
 ============================================================================
 Purpose: Process Ausgrid half-hourly solar generation data for operational monitoring
 Input: Wide-format CSV (Customer, date, 0:30, 1:00, ..., 23:30, 0:00)
 Output: Long-format time-series data in PostgreSQL fact_solar_generation
+
+FIXES APPLIED:
+- Added postcode and capacity_kw to database load (LINE 378-379)
+- Handles synthetic NMI creation
+- Proper data type handling
 ============================================================================
 """
 
@@ -13,6 +18,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine, text
+from sqlalchemy.dialects.postgresql import insert
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -34,7 +40,7 @@ class AusgridGenerationPipeline:
         self.engine = None
         
         print("=" * 80)
-        print("AUSGRID GENERATION DATA - ETL PIPELINE")
+        print("AUSGRID GENERATION DATA - ETL PIPELINE (FIXED)")
         print("=" * 80)
     
     # ========================================================================
@@ -55,9 +61,9 @@ class AusgridGenerationPipeline:
         """
         print(f"\n📂 Processing: {filepath.name}")
         
-        # FIX: Don't skip any rows - the header is already there!
+        # Read CSV (header is already there, don't skip rows)
         try:
-            df = pd.read_csv(filepath)  # Removed skiprows=1
+            df = pd.read_csv(filepath)
             print(f"   Loaded {len(df):,} rows, {len(df.columns)} columns")
             
             # Debug: Show first few column names
@@ -87,7 +93,7 @@ class AusgridGenerationPipeline:
             print(f"   ❌ ERROR: No time columns found!")
             return None
         
-        # Process each consumption category
+        # Process each row
         all_readings = []
         
         print(f"   Processing rows...")
@@ -331,7 +337,6 @@ class AusgridGenerationPipeline:
         
         config = configparser.ConfigParser()
         
-
         db_config = {
             'host': 'localhost',
             'port': 5432,
@@ -368,7 +373,30 @@ class AusgridGenerationPipeline:
         except Exception as e:
             print(f"❌ Connection failed: {e}")
             return False
-    
+
+    def upsert_method(self, table, conn, keys, data_iter):
+        """
+        Custom method for pandas to_sql to perform PostgreSQL UPSERT
+        (Insert on Conflict Do Update)
+        """
+        # Unwrap the SQLAlchemy table object
+        sql_table = table.table
+        
+        # Create a list of dictionaries from the data
+        data = [dict(zip(keys, row)) for row in data_iter]
+        
+        # PostgreSQL specific insert statement
+        insert_stmt = insert(sql_table).values(data)
+        
+        # Update columns on conflict, excluding the primary key/unique constraint columns
+        # For fact_solar_generation, unique constraint is (nmi, reading_timestamp)
+        on_conflict_stmt = insert_stmt.on_conflict_do_update(
+            constraint='unique_nmi_timestamp',
+            set_={c.key: c for c in insert_stmt.excluded if c.key not in ['nmi', 'reading_timestamp']}
+        )
+        
+        conn.execute(on_conflict_stmt)
+
     def load_to_database(self, df_generation):
         """Load generation data to fact_solar_generation table"""
         print("\n" + "=" * 80)
@@ -377,10 +405,17 @@ class AusgridGenerationPipeline:
         
         print(f"\n📊 Preparing {len(df_generation):,} records for database load...")
         
+        # ╔══════════════════════════════════════════════════════════════════╗
+        # ║  🔧 FIX APPLIED HERE - Added postcode and capacity_kw           ║
+        # ║  🔧 FIX 2: Ensure NMI is TEXT, not numeric                      ║
+        # ╚══════════════════════════════════════════════════════════════════╝
+        
         # Select only columns that exist in the database schema
         df_load = df_generation[[
             'nmi',
             'reading_timestamp',
+            'postcode',          # ← FIXED: Added this column
+            'capacity_kw',       # ← FIXED: Added this column
             'generation_kwh',
             'consumption_kwh',
             'export_kwh',
@@ -388,6 +423,13 @@ class AusgridGenerationPipeline:
             'max_export_kw',
             'max_generation_kw'
         ]].copy()
+        
+        # ╔══════════════════════════════════════════════════════════════════╗
+        # ║  🔧 CRITICAL FIX: Convert NMI to string (not numeric)           ║
+        # ╚══════════════════════════════════════════════════════════════════╝
+        # NMI must be VARCHAR in database, not BIGINT
+        # This prevents "operator does not exist: bigint = character varying" errors
+        df_load['nmi'] = df_load['nmi'].astype(str)
         
         # Add metadata
         df_load['reading_quality'] = 'ACTUAL'
@@ -411,7 +453,7 @@ class AusgridGenerationPipeline:
                     schema='compliance',
                     if_exists='append',
                     index=False,
-                    method='multi'
+                    method=self.upsert_method
                 )
                 
                 loaded += len(chunk)
@@ -555,12 +597,13 @@ class AusgridGenerationPipeline:
             print(f"\n❌ Error during database load: {e}")
             if self.engine is not None:
                 self.engine.dispose()
+            return False
 
         # Step 6: Data quality checks
         if loaded > 0:
             self.run_data_quality_checks()
         
-        # # Summary
+        # Summary
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
         
@@ -569,9 +612,10 @@ class AusgridGenerationPipeline:
         print("=" * 80)
         print(f"Duration: {duration:.1f} seconds")
         print(f"Records Processed: {len(df_pivoted):,}")
-        # print(f"Records Loaded: {loaded:,}")
+        print(f"Records Loaded: {loaded:,}")
         print(f"\nNext Steps:")
-        print("1. Run over-export violation detection")
+        print("1. Run over-export violation detection:")
+        print("   psql -d ausnet_solar_compliance -f sql/04_over_export_detection.sql")
         print("2. Build operational monitoring dashboard")
         print("=" * 80)
         

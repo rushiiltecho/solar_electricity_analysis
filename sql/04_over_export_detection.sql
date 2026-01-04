@@ -1,32 +1,87 @@
 -- ============================================================================
--- OVER-EXPORT VIOLATION DETECTION (FIXED FOR SYNTHETIC NMIs)
+-- FINAL FIX: Convert fact_solar_installation.nmi to VARCHAR
 -- ============================================================================
--- Purpose: Detect solar installations exceeding approved export limits
--- Data Source: fact_solar_generation (Ausgrid half-hourly readings)
--- Fixed: Handles synthetic NMIs, ROUND() type casting
+-- Problem: fact_solar_installation.nmi is BIGINT but should be VARCHAR
+-- Solution: Convert the column type to match fact_solar_generation
 -- ============================================================================
 
 SET search_path TO compliance, reference, public;
 
+\echo '============================================================'
+\echo 'FIXING NMI DATA TYPE MISMATCH'
+\echo '============================================================'
+\echo ''
+
+-- Step 1: Drop foreign key constraints if they exist
+DO $$
+BEGIN
+    -- Drop constraint from fact_violation if it exists
+    IF EXISTS (
+        SELECT 1 FROM information_schema.table_constraints 
+        WHERE constraint_name = 'fact_violation_nmi_fkey'
+        AND table_name = 'fact_violation'
+    ) THEN
+        ALTER TABLE compliance.fact_violation 
+        DROP CONSTRAINT fact_violation_nmi_fkey;
+        RAISE NOTICE '✓ Dropped foreign key constraint';
+    END IF;
+END $$;
+
+-- Step 2: Convert NMI column from BIGINT to VARCHAR
+\echo 'Converting fact_solar_installation.nmi from BIGINT to VARCHAR...'
+
+ALTER TABLE compliance.fact_solar_installation 
+ALTER COLUMN nmi TYPE VARCHAR(11) USING nmi::TEXT;
+
+\echo '✓ Converted NMI to VARCHAR(11)'
+\echo ''
+
+-- Step 3: Verify the change
+DO $$
+DECLARE
+    gen_type TEXT;
+    install_type TEXT;
+BEGIN
+    SELECT data_type INTO gen_type
+    FROM information_schema.columns
+    WHERE table_schema = 'compliance'
+      AND table_name = 'fact_solar_generation'
+      AND column_name = 'nmi';
+    
+    SELECT data_type INTO install_type
+    FROM information_schema.columns
+    WHERE table_schema = 'compliance'
+      AND table_name = 'fact_solar_installation'
+      AND column_name = 'nmi';
+    
+    RAISE NOTICE 'Verification:';
+    RAISE NOTICE '  fact_solar_generation.nmi   = %', gen_type;
+    RAISE NOTICE '  fact_solar_installation.nmi = %', install_type;
+    
+    IF gen_type = install_type THEN
+        RAISE NOTICE '✓ Types now match!';
+    ELSE
+        RAISE EXCEPTION 'Types still do not match!';
+    END IF;
+END $$;
+
+\echo ''
+\echo '============================================================'
+\echo 'NOW RUNNING OVER-EXPORT DETECTION'
+\echo '============================================================'
+\echo ''
+
+-- ============================================================================
+-- OVER-EXPORT VIOLATION DETECTION
+-- ============================================================================
+
 DO $$
 BEGIN
     RAISE NOTICE '';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE 'OVER-EXPORT VIOLATION DETECTION - AUSGRID DATA';
-    RAISE NOTICE '============================================================';
+    RAISE NOTICE 'Step 0: Creating synthetic installations for Ausgrid data...';
 END $$;
 
--- ============================================================================
--- STEP 0: Add Synthetic Installations to fact_solar_installation (If Needed)
--- ============================================================================
-
-DO $$
-BEGIN
-    RAISE NOTICE '';
-    RAISE NOTICE 'Step 0: Ensuring synthetic Ausgrid installations exist...';
-END $$;
-
--- Insert synthetic installations for Ausgrid customers that don't exist
+-- Create synthetic installations for Ausgrid customers
 INSERT INTO compliance.fact_solar_installation (
     nmi,
     postcode,
@@ -43,36 +98,28 @@ INSERT INTO compliance.fact_solar_installation (
     is_multi_meter,
     is_meter_consolidated
 )
-SELECT DISTINCT
-    g.nmi,
+SELECT 
+    g.nmi,  -- Both VARCHAR now
     g.postcode,
     g.capacity_kw,
-    MIN(DATE(g.reading_timestamp)) as installation_date,  -- First reading date
+    MIN(DATE(g.reading_timestamp)) as installation_date,
     MIN(DATE(g.reading_timestamp)) as connection_date,
     MIN(DATE(g.reading_timestamp)) - INTERVAL '30 days' as application_date,
     'APPROVED' as application_status,
-    -- Set approved export limit as 1.2x capacity (industry standard)
-    CAST(g.capacity_kw * 1.2 AS DECIMAL(10,2)) as approved_export_limit_kw,
-    'TRF001' as tariff_code,  -- Default tariff
-    1 as installer_id,  -- Default installer
+    ROUND((g.capacity_kw * 1.2)::numeric, 2) as approved_export_limit_kw,
+    'TRF001' as tariff_code,
+    1 as installer_id,
     FALSE as has_battery,
     NULL as battery_capacity_kwh,
     FALSE as is_multi_meter,
     FALSE as is_meter_consolidated
-FROM (
-    SELECT DISTINCT
-        nmi,
-        postcode,
-        capacity_kw,
-        reading_timestamp
-    FROM compliance.fact_solar_generation
-    WHERE data_source = 'AUSGRID_2012_2013'
-) g
-WHERE NOT EXISTS (
-    SELECT 1 
-    FROM compliance.fact_solar_installation i
-    WHERE i.nmi = g.nmi
-)
+FROM compliance.fact_solar_generation g
+WHERE g.data_source = 'AUSGRID_2012_2013'
+  AND NOT EXISTS (
+      SELECT 1 
+      FROM compliance.fact_solar_installation i
+      WHERE i.nmi = g.nmi  -- Both VARCHAR - no cast needed!
+  )
 GROUP BY g.nmi, g.postcode, g.capacity_kw;
 
 DO $$
@@ -80,11 +127,11 @@ DECLARE
     inserted_count INTEGER;
 BEGIN
     GET DIAGNOSTICS inserted_count = ROW_COUNT;
-    RAISE NOTICE '   ✓ Ensured % Ausgrid installations exist in fact_solar_installation', inserted_count;
+    RAISE NOTICE '   ✓ Created % Ausgrid installations in fact_solar_installation', inserted_count;
 END $$;
 
 -- ============================================================================
--- STEP 1: Calculate Daily Peak Export for Each Installation
+-- STEP 1: Calculate Daily Peak Export
 -- ============================================================================
 
 DO $$
@@ -93,7 +140,6 @@ BEGIN
     RAISE NOTICE 'Step 1: Calculating daily peak export values...';
 END $$;
 
--- Create temporary table with daily max export
 DROP TABLE IF EXISTS temp_daily_max_export;
 
 CREATE TEMP TABLE temp_daily_max_export AS
@@ -110,7 +156,6 @@ WHERE g.max_export_kw IS NOT NULL
   AND g.max_export_kw > 0
 GROUP BY g.nmi, DATE(g.reading_timestamp);
 
--- Create index for faster joining
 CREATE INDEX idx_temp_daily_nmi ON temp_daily_max_export(nmi);
 
 DO $$
@@ -131,7 +176,6 @@ BEGIN
     RAISE NOTICE 'Step 2: Identifying over-export violations...';
 END $$;
 
--- Insert violations
 INSERT INTO compliance.fact_violation (
     nmi,
     violation_type,
@@ -146,12 +190,11 @@ INSERT INTO compliance.fact_violation (
     status
 )
 SELECT 
-    d.nmi::TEXT,
+    d.nmi,
     'OVER_EXPORT',
     'NETWORK',
     CURRENT_DATE,
     CASE 
-        -- Severity based on extent of over-export
         WHEN d.max_export_kw > i.approved_export_limit_kw * 1.5 THEN 'CRITICAL'
         WHEN d.max_export_kw > i.approved_export_limit_kw * 1.2 THEN 'MAJOR'
         ELSE 'MINOR'
@@ -160,43 +203,34 @@ SELECT
         'Installation at postcode ', i.postcode,
         ' (capacity: ', i.capacity_kw, 'kW) ',
         'exceeded approved export limit of ', i.approved_export_limit_kw, 'kW. ',
-        'Peak export recorded: ', CAST(d.max_export_kw AS DECIMAL(10,2)), 'kW on ', d.export_date, '. ',
-        'Overage: ', CAST((d.max_export_kw - i.approved_export_limit_kw) AS DECIMAL(10,2)), 'kW ',
-        '(', CAST(((d.max_export_kw / i.approved_export_limit_kw - 1) * 100) AS DECIMAL(10,1)), '% over limit). ',
-        'Total daily export: ', CAST(d.total_export_kwh AS DECIMAL(10,2)), 'kWh'
+        'Peak export recorded: ', ROUND(d.max_export_kw::numeric, 2), 'kW on ', d.export_date, '. ',
+        'Overage: ', ROUND((d.max_export_kw - i.approved_export_limit_kw)::numeric, 2), 'kW ',
+        '(', ROUND(((d.max_export_kw / i.approved_export_limit_kw - 1) * 100)::numeric, 1), '% over limit). ',
+        'Total daily export: ', ROUND(d.total_export_kwh::numeric, 2), 'kWh'
     ),
-    CAST(d.max_export_kw AS DECIMAL(10,2)),
-    CAST(i.approved_export_limit_kw AS DECIMAL(10,2)),
-    1,  -- Days in violation (per occurrence)
-    -- FIX: Add explicit CAST for financial impact calculation
-    -- Base penalty: $50 per kW over limit per day
-    -- Network stress surcharge: Additional $100 if >150% of limit
-    CAST(
-        (d.max_export_kw - i.approved_export_limit_kw) * 50 +
-        CASE WHEN d.max_export_kw > i.approved_export_limit_kw * 1.5 THEN 100 ELSE 0 END
-        AS DECIMAL(12,2)
+    ROUND(d.max_export_kw::numeric, 2),
+    ROUND(i.approved_export_limit_kw::numeric, 2),
+    1,
+    ROUND(
+        ((d.max_export_kw - i.approved_export_limit_kw) * 50 +
+        CASE WHEN d.max_export_kw > i.approved_export_limit_kw * 1.5 THEN 100 ELSE 0 END)::numeric,
+        2
     ),
     'NEW'
 FROM temp_daily_max_export d
-JOIN compliance.fact_solar_installation i ON d.nmi::TEXT = i.nmi::TEXT
-WHERE 1=1
-  -- Only flag if over the approved limit
-  AND d.max_export_kw > i.approved_export_limit_kw
-  -- Must have an approved limit on file
+JOIN compliance.fact_solar_installation i ON d.nmi = i.nmi  -- Both VARCHAR!
+WHERE d.max_export_kw > i.approved_export_limit_kw
   AND i.approved_export_limit_kw IS NOT NULL
   AND i.approved_export_limit_kw > 0
-  -- Don't create duplicate violations for same NMI
   AND NOT EXISTS (
       SELECT 1 
       FROM compliance.fact_violation v
-      WHERE v.nmi::TEXT = d.nmi::TEXT
+      WHERE v.nmi = d.nmi
         AND v.violation_type = 'OVER_EXPORT'
         AND v.status IN ('NEW', 'INVESTIGATING')
-        -- Only avoid duplicates if they're for the same date
         AND v.detected_date = d.export_date
   );
 
--- Report results
 DO $$
 DECLARE
     violation_count INTEGER;
@@ -220,6 +254,7 @@ BEGIN
     FROM compliance.fact_violation
     WHERE violation_type = 'OVER_EXPORT';
     
+    RAISE NOTICE '';
     RAISE NOTICE '   ✓ Detected % over-export violations', violation_count;
     RAISE NOTICE '      - Critical: %', critical_count;
     RAISE NOTICE '      - Major: %', major_count;
@@ -236,7 +271,7 @@ BEGIN
     RAISE NOTICE 'Step 3: Creating operational analytics views...';
 END $$;
 
--- View 1: Daily Export Summary by Installation
+-- View 1: Daily Export Summary
 DROP VIEW IF EXISTS compliance.vw_daily_export_summary CASCADE;
 
 CREATE VIEW compliance.vw_daily_export_summary AS
@@ -250,24 +285,19 @@ SELECT
     AVG(g.max_export_kw) as avg_export_kw,
     SUM(g.export_kwh) as total_export_kwh,
     COUNT(*) as reading_count,
-    -- Over-limit indicator
     CASE 
         WHEN MAX(g.max_export_kw) > i.approved_export_limit_kw THEN TRUE 
         ELSE FALSE 
     END as exceeded_limit,
-    -- Percentage over limit (FIX: Add explicit CAST)
     CASE 
         WHEN i.approved_export_limit_kw > 0 THEN
-            CAST(((MAX(g.max_export_kw) / i.approved_export_limit_kw - 1) * 100) AS DECIMAL(10,2))
+            ROUND(((MAX(g.max_export_kw) / i.approved_export_limit_kw - 1) * 100)::numeric, 2)
         ELSE NULL
     END as pct_over_limit
 FROM compliance.fact_solar_generation g
-JOIN compliance.fact_solar_installation i ON g.nmi::TEXT = i.nmi::TEXT
+JOIN compliance.fact_solar_installation i ON g.nmi = i.nmi  -- Both VARCHAR!
 WHERE g.export_kwh IS NOT NULL
 GROUP BY g.nmi, i.postcode, i.capacity_kw, i.approved_export_limit_kw, DATE(g.reading_timestamp);
-
-COMMENT ON VIEW compliance.vw_daily_export_summary IS 
-'Daily export summary with over-limit detection for operational monitoring';
 
 -- View 2: Hourly Export Patterns
 DROP VIEW IF EXISTS compliance.vw_hourly_export_patterns CASCADE;
@@ -285,9 +315,6 @@ FROM compliance.fact_solar_generation g
 WHERE g.export_kwh IS NOT NULL
 GROUP BY g.nmi, EXTRACT(HOUR FROM g.reading_timestamp), EXTRACT(DOW FROM g.reading_timestamp);
 
-COMMENT ON VIEW compliance.vw_hourly_export_patterns IS 
-'Hourly export patterns for identifying peak export times';
-
 -- View 3: Network Load Analysis
 DROP VIEW IF EXISTS compliance.vw_network_load_analysis CASCADE;
 
@@ -300,19 +327,15 @@ SELECT
     SUM(g.max_export_kw) as total_export_kw,
     AVG(g.max_export_kw) as avg_export_kw,
     MAX(g.max_export_kw) as peak_single_export_kw,
-    -- Network stress indicator (>70% of installations exporting simultaneously)
     CASE 
         WHEN COUNT(CASE WHEN g.max_export_kw > 0 THEN 1 END)::FLOAT / 
-             NULLIF(COUNT(DISTINCT g.nmi), 0) > 0.7 
+             NULLIF(COUNT(DISTINCT g.nmi), 0) > 0.7
         THEN TRUE 
         ELSE FALSE 
     END as network_stress
 FROM compliance.fact_solar_generation g
-JOIN compliance.fact_solar_installation i ON g.nmi::TEXT = i.nmi::TEXT
+JOIN compliance.fact_solar_installation i ON g.nmi = i.nmi  -- Both VARCHAR!
 GROUP BY i.postcode, DATE(g.reading_timestamp), EXTRACT(HOUR FROM g.reading_timestamp);
-
-COMMENT ON VIEW compliance.vw_network_load_analysis IS 
-'Network-level load analysis showing aggregate export by postcode and time';
 
 -- View 4: Top Over-Exporters
 DROP VIEW IF EXISTS compliance.vw_top_over_exporters CASCADE;
@@ -331,15 +354,12 @@ SELECT
     i.installer_id,
     i.installation_date
 FROM compliance.fact_violation v
-JOIN compliance.fact_solar_installation i ON v.nmi::TEXT = i.nmi::TEXT
+JOIN compliance.fact_solar_installation i ON v.nmi = i.nmi  -- Both VARCHAR!
 WHERE v.violation_type = 'OVER_EXPORT'
   AND v.status IN ('NEW', 'INVESTIGATING')
 GROUP BY v.nmi, i.postcode, i.capacity_kw, i.approved_export_limit_kw, 
          i.installer_id, i.installation_date
 ORDER BY total_penalties DESC;
-
-COMMENT ON VIEW compliance.vw_top_over_exporters IS 
-'Ranked list of installations with most frequent/severe over-export violations';
 
 DO $$
 BEGIN
@@ -347,7 +367,7 @@ BEGIN
 END $$;
 
 -- ============================================================================
--- STEP 4: Create Summary Statistics
+-- STEP 4: Summary Statistics
 -- ============================================================================
 
 DO $$
@@ -358,22 +378,20 @@ BEGIN
     RAISE NOTICE '============================================================';
 END $$;
 
--- Display summary table
 SELECT 
     'Over-Export Violations Detected' as metric,
     COUNT(*) as count,
-    CAST(SUM(financial_impact) AS DECIMAL(15,2)) as total_financial_impact,
-    CAST(AVG(max_export_recorded_kw - approved_limit_kw) AS DECIMAL(10,2)) as avg_overage_kw,
-    CAST(MAX(max_export_recorded_kw - approved_limit_kw) AS DECIMAL(10,2)) as max_overage_kw
+    ROUND(COALESCE(SUM(financial_impact), 0)::numeric, 2) as total_financial_impact,
+    ROUND(COALESCE(AVG(max_export_recorded_kw - approved_limit_kw), 0)::numeric, 2) as avg_overage_kw,
+    ROUND(COALESCE(MAX(max_export_recorded_kw - approved_limit_kw), 0)::numeric, 2) as max_overage_kw
 FROM compliance.fact_violation
 WHERE violation_type = 'OVER_EXPORT';
 
--- Severity breakdown
 SELECT 
     severity,
     COUNT(*) as violation_count,
-    CAST(AVG(max_export_recorded_kw - approved_limit_kw) AS DECIMAL(10,2)) as avg_overage_kw,
-    CAST(SUM(financial_impact) AS DECIMAL(15,2)) as total_penalties
+    ROUND(AVG(max_export_recorded_kw - approved_limit_kw)::numeric, 2) as avg_overage_kw,
+    ROUND(SUM(financial_impact)::numeric, 2) as total_penalties
 FROM compliance.fact_violation
 WHERE violation_type = 'OVER_EXPORT'
 GROUP BY severity
@@ -384,22 +402,18 @@ ORDER BY
         WHEN 'MINOR' THEN 3
     END;
 
--- Clean up temp table
 DROP TABLE IF EXISTS temp_daily_max_export;
 
-DO $$
-BEGIN
-    RAISE NOTICE '';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE '✓ OVER-EXPORT DETECTION COMPLETE!';
-    RAISE NOTICE '============================================================';
-    RAISE NOTICE 'Results stored in: compliance.fact_violation';
-    RAISE NOTICE 'Analytics views created:';
-    RAISE NOTICE '  - vw_daily_export_summary';
-    RAISE NOTICE '  - vw_hourly_export_patterns';
-    RAISE NOTICE '  - vw_network_load_analysis';
-    RAISE NOTICE '  - vw_top_over_exporters';
-    RAISE NOTICE '';
-    RAISE NOTICE 'Next Step: Build operational monitoring dashboard';
-    RAISE NOTICE '============================================================';
-END $$;
+\echo ''
+\echo '============================================================'
+\echo '✓ COMPLETE!'
+\echo '============================================================'
+\echo 'Results stored in: compliance.fact_violation'
+\echo 'Analytics views created:'
+\echo '  - vw_daily_export_summary'
+\echo '  - vw_hourly_export_patterns'
+\echo '  - vw_network_load_analysis'
+\echo '  - vw_top_over_exporters'
+\echo ''
+\echo 'Next: Build your Power BI dashboard!'
+\echo '============================================================'
