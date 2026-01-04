@@ -1,0 +1,13 @@
+#!/bin/bash
+echo "========================================="
+echo "DOWNLOAD REQUIRED DATASETS"
+echo "========================================="
+echo ""
+echo "Please download the following datasets manually:"
+echo ""
+echo "1. Clean Energy Regulator (CER) Solar Data"
+echo "   URL: https://cer.gov.au/markets/reports-and-data/small-scale-installation-postcode-data"
+echo "   File: SGU-Solar - Installations - 2011 to present.csv"
+echo "   Save to: data/raw/SGU-Solar-Installations-2011-present.csv"
+echo ""
+read -p "Press Enter after download completes..."

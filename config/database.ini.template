@@ -1,0 +1,13 @@
+[postgresql]
+host=localhost
+port=5432
+database=ausnet_solar_compliance
+user=postgres
+password=your_password_here
+
+[paths]
+data_dir=../data
+raw_dir=../data/raw
+processed_dir=../data/processed
+simulated_dir=../data/simulated
+logs_dir=../logs

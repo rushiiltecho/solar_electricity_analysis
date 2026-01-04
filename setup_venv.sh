@@ -1,0 +1,9 @@
+#!/bin/bash
+echo "Creating Python virtual environment..."
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+echo ""
+echo "✓ Virtual environment created and dependencies installed"
+echo "To activate: source venv/bin/activate"
